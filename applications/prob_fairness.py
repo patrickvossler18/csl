@@ -10,8 +10,6 @@ import torch
 import torch.nn.functional as F
 from sklearn.model_selection import train_test_split
 
-sys.path.append("/Users/vossler/csl")
-
 import csl
 
 
