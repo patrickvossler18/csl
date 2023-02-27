@@ -2,3 +2,5 @@
 docs/_build
 applications/data
 envs
+.DS_Store
+.vscode/
