@@ -4,3 +4,5 @@ applications/data
 envs
 .DS_Store
 .vscode/
+build/
+*.egg-info
