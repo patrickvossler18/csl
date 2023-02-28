@@ -191,7 +191,7 @@ class fairClassification(csl.ConstrainedLearningProblem):
         if rhs is not None:
             self.constraints = [
                 self.DisparityEstimate(self),
-                self.CondtlCovariance(self),
+                # self.CondtlCovariance(self),
             ]
             self.rhs = rhs
 
@@ -203,7 +203,7 @@ class fairClassification(csl.ConstrainedLearningProblem):
         yhat = self.model(x)
 
         # regularizing betas here
-        return F.cross_entropy(yhat, y) + 1e-3 * (
+        return F.cross_entropy(yhat, y) + 0 * (
             self.model.parameters[0] ** 2 + self.model.parameters[1].norm() ** 2
         )
 
@@ -263,7 +263,7 @@ class fairClassification(csl.ConstrainedLearningProblem):
                 for val in B_unique:
                     expect_cov += self.calc_condtl_exp(yhat[:, 1], b, B, val)
             # flipping sign since our constraint should be of form g(x) <= 0
-            return expect_cov
+            return -expect_cov
 
         def calc_condtl_exp(self, yhat, prob_feat, true_feat, true_feat_value):
             prob_emp = (true_feat == true_feat_value).sum().div(true_feat.shape[0])
@@ -279,26 +279,37 @@ class fairClassification(csl.ConstrainedLearningProblem):
 
 # The first argument for rhs is the rhs value for disparity and the second position is for the conditional covariance.
 # if we pass rhs=None then it is equivalent to solving the unconstrained problem
-problem = fairClassification(train_data, rhs=[0.01, 0])
+problems = {
+    "unconstrained": fairClassification(train_data),
+    "constrained": fairClassification(train_data, rhs=[0.05]),
+}
 
 
 #%% ################################
 # TRAINING                         #
 ####################################
 solver_settings = {
-    "iterations": 700,
+    "iterations": 1400,
     "batch_size": None,
     "primal_solver": lambda p: torch.optim.Adam(p, lr=0.2),
-    "dual_solver": lambda p: torch.optim.Adam(p, lr=0.001),
+    "dual_solver": lambda p: torch.optim.Adam(p, lr=0.01),
 }
 solver = csl.PrimalDual(solver_settings)
 
-solver.reset()
-solver.solve(problem)
-solver.plot()  # ?? not sure what this does
+solutions = {}
 
-lambdas = problem.lambdas
-solver_state = solver.state_dict
+for key, problem in problems.items():
+    solver.reset()
+    solver.solve(problem)
+    solver.plot()  # displays diagnostic plots
+
+    lambdas = problem.lambdas
+    solver_state = solver.state_dict
+    solutions[key] = {
+        "model": problem.model,
+        "lambdas": problem.lambdas,
+        "solver_state": solver.state_dict,
+    }
 
 
 # ####################################
@@ -309,9 +320,44 @@ def accuracy(pred, y):
     return correct / pred.shape[0]
 
 
-with torch.no_grad():
-    x_test, y_test, prob_feat, true_feat = test_data[:]
-    yhat = problem.model.predict(x_test)
+def d_l_hat(yhat, prob_feat):
+    yhat = yhat.numpy()
+    prob_feat = prob_feat.numpy()
+    return np.sum((yhat - np.mean(yhat)) * (prob_feat - np.mean(prob_feat))) / np.sum(
+        (prob_feat - np.mean(prob_feat)) ** 2
+    )
 
-    acc_test = accuracy(yhat, y_test)
-    # other metrics we want to evaluate here
+
+def exp_condtl_cov(y_pred, prob_feat, true_feat):
+    y_pred = y_pred.numpy()
+    prob_feat = prob_feat.numpy()
+    true_feat = true_feat.numpy()
+    p_1 = np.mean(true_feat == 1)
+    Y_hat_1 = y_pred[true_feat == 1]
+    b_1 = prob_feat[true_feat == 1]
+    b_bar_1 = np.mean(b_1)
+
+    p_0 = np.mean(true_feat == 0)
+    Y_hat_0 = y_pred[true_feat == 0]
+    b_0 = prob_feat[true_feat == 0]
+    b_bar_0 = np.mean(b_0)
+
+    return p_1 * (1 / np.sum(true_feat == 1)) * np.sum(
+        Y_hat_1 * (b_1 - b_bar_1)
+    ) + p_0 * (1 / np.sum(true_feat == 0)) * np.sum(Y_hat_0 * (b_0 - b_bar_0))
+
+
+for key, solution in solutions.items():
+    print(f"Model: {key}")
+    with torch.no_grad():
+        x_test, y_test, prob_feat, true_feat = test_data[:]
+        yhat = solution["model"].predict(x_test)
+        acc_test = accuracy(yhat, y_test)
+        # other metrics we want to evaluate here
+        d_l_test = d_l_hat(yhat, prob_feat)
+        exp_condtl_cov_test = exp_condtl_cov(yhat, prob_feat, true_feat)
+        # let's check that our constraints are satisfied
+        print(f"Accuracy: {acc_test:.4f}")
+        print(f"D_l_hat for the test data: {d_l_test:.4f}")
+        print(f"Exp_condtl_cov for the test data: {exp_condtl_cov_test:.4f}")
+        print(f"Lambdas: {solution['lambdas']}")
