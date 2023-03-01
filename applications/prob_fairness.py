@@ -17,6 +17,10 @@ import csl
 # DATA                             #
 ####################################
 def generate_toy_data(n=100000, seed=12345, outcome_type="binary"):
+    """
+    Function for generating toy data. Originally written by Hadi with slight changes for reproducibility and adding in an option for a continuous response.
+    The reproducibility change is to use a numpy rng and use a seed for the random number generation
+    """
     rng = np.random.default_rng(seed)
     probs = [rng.uniform() for i in range(n)]
     race = rng.binomial(1, probs)
@@ -202,7 +206,7 @@ class fairClassification(csl.ConstrainedLearningProblem):
         x, y, prob_feat, true_feat = self.data[batch_idx]
         yhat = self.model(x)
 
-        # regularizing betas here
+        # the original code regularizes the betas here but for the toy example we only have two features so it seems a bit unnecessary?
         return F.cross_entropy(yhat, y) + 0 * (
             self.model.parameters[0] ** 2 + self.model.parameters[1].norm() ** 2
         )
@@ -210,7 +214,7 @@ class fairClassification(csl.ConstrainedLearningProblem):
     class DisparityEstimate:
         def __init__(self, problem):
             """
-            prob_feat: array of the probabilistic estimates of the protected feature. Should be of shape (x.shape[0], 1)
+            problem: Instantiation of the class that calls this constraint class. This is needed for some reason because we are making use of the __call__ function.
             """
             self.problem = problem
 
@@ -237,12 +241,15 @@ class fairClassification(csl.ConstrainedLearningProblem):
     class CondtlCovariance:
         def __init__(self, problem):
             """
-            prob_feat: array of the probabilistic estimates of the protected feature. Should be of shape (x.shape[0], 1)
-            true_feat: array of the observed values of the protected feature. Should be of shape (x.shape[0], 1)
+            problem: Instantiation of the class that calls this constraint class. This is needed for some reason because we are making use of the __call__ function.
             """
             self.problem = problem
 
         def __call__(self, batch_idx, primal):
+            """
+            prob_feat: array of the probabilistic estimates of the protected feature. Should be of shape (x.shape[0], 1)
+            true_feat: array of the observed values of the protected feature. Should be of shape (x.shape[0], 1)
+            """
             x, y, prob_feat, true_feat = self.problem.data[batch_idx]
 
             B = true_feat
@@ -262,10 +269,11 @@ class fairClassification(csl.ConstrainedLearningProblem):
                 expect_cov = 0.0
                 for val in B_unique:
                     expect_cov += self.calc_condtl_exp(yhat[:, 1], b, B, val)
-            # flipping sign since our constraint should be of form g(x) <= 0
+            # our constraint should be of form g(x) <= 0 so if we want the covariance to be positive then we need to return -g(x) but if we want covariance to be negative we want g(x).
             return -expect_cov
 
         def calc_condtl_exp(self, yhat, prob_feat, true_feat, true_feat_value):
+            # overly complex way to compute mean since pytorch doesn't let you take mean of boolean values??
             prob_emp = (true_feat == true_feat_value).sum().div(true_feat.shape[0])
             Y_hat = yhat[true_feat == true_feat_value]
             b = prob_feat[true_feat == true_feat_value]
