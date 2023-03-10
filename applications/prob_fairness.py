@@ -5,7 +5,6 @@ import sys
 
 import numpy as np
 import pandas as pd
-import sklearn as skl
 import torch
 import torch.nn.functional as F
 from sklearn.model_selection import train_test_split
@@ -187,15 +186,31 @@ class Logistic:
 # PROBLEM                          #
 ####################################
 class fairClassification(csl.ConstrainedLearningProblem):
-    def __init__(self, data, rhs=None):
+    def __init__(self, data, rhs=None, cov_positive=True, d_l_pos=False, d_w_pos=False):
+        """
+        data: torch dataset
+        rhs: Values for right-hand side of constraints. Expects the ordering to be constraint values for D_l, D_w, E(Cov(Y_hat, b | B)), E(Cov(Y_hat, B | b))
+        cov_positive: Flag for whether to constrain the expected conditional covariance to be positive or not
+        d_l_pos: Flag for whether D_l constraint takes the form D_l <= a.
+        d_w_pos: Flag for whether D_w constraint takes the form D_w <= a.
+        """
         self.model = Logistic(data[0][0].shape[1])
         self.data = data
         self.obj_function = self.loss
+        self.cov_positive = cov_positive
+        self.d_l_pos = d_l_pos
+        self.d_w_pos = d_w_pos
 
         if rhs is not None:
             self.constraints = [
-                self.DisparityEstimate(self),
-                # self.CondtlCovariance(self),
+                self.LinearDisparityEstimate(self, positive=self.d_l_pos),  # D_l,
+                self.WeightedDisparityEstimate(self, positive=self.d_w_pos),  # D_w
+                self.CondtlCovariance(
+                    self, positive=self.cov_positive, cov_prob_feat=True
+                ),  # E(Cov(Y_hat, b | B))
+                self.CondtlCovariance(
+                    self, positive=self.cov_positive, cov_prob_feat=False
+                ),  # E(Cov(Y_hat, B | b))
             ]
             self.rhs = rhs
 
@@ -211,12 +226,16 @@ class fairClassification(csl.ConstrainedLearningProblem):
             self.model.parameters[0] ** 2 + self.model.parameters[1].norm() ** 2
         )
 
-    class DisparityEstimate:
-        def __init__(self, problem):
+    class LinearDisparityEstimate:
+        def __init__(self, problem, positive):
             """
+            class for calculating the linear estimate of Demographic Parity
+
             problem: Instantiation of the class that calls this constraint class. This is needed for some reason because we are making use of the __call__ function.
+            positive: A flag for the direction of the constraint. If true we want D_l >= c. Default is False.
             """
             self.problem = problem
+            self.positive = positive
 
         def __call__(self, batch_idx, primal):
             x, y, prob_feat, true_feat = self.problem.data[batch_idx]
@@ -224,26 +243,60 @@ class fairClassification(csl.ConstrainedLearningProblem):
             b = prob_feat
             b_bar = torch.mean(b)
 
-            # if primal:
             # not sure whether we need the primal flag
-            if primal:
-                yhat = self.problem.model(x)
-                d_l = torch.sum(
-                    ((yhat[:, 1] - torch.mean(yhat[:, 1])) * (b - b_bar))
-                ) / torch.sum((b - b_bar) ** 2)
+            # if primal:
+            # Logistic model returns prob 0 and prob 1, we want prob 1
+            yhat = self.problem.model(x)[:, 1]
+            d_l = torch.sum(((yhat - torch.mean(yhat)) * (b - b_bar))) / torch.sum(
+                (b - b_bar) ** 2
+            )
+            # CSL expects constraints to take the form g(x) <= c so if we want the constraint to be flipped we should return -g(x) otherwise we return just g(x)
+            if self.positive:
+                return -d_l
             else:
-                yhat = self.problem.model(x)
-                d_l = torch.sum(
-                    ((yhat[:, 1] - torch.mean(yhat[:, 1])) * (b - b_bar))
-                ) / torch.sum((b - b_bar) ** 2)
-            return d_l
+                return d_l
 
-    class CondtlCovariance:
-        def __init__(self, problem):
+    class WeightedDisparityEstimate:
+        def __init__(self, problem, positive):
             """
+            Class for calculating the weighted estimate of Demographic Parity
+
             problem: Instantiation of the class that calls this constraint class. This is needed for some reason because we are making use of the __call__ function.
+            positive: A flag for the direction of the constraint. If true we want D_w >= c. Default is False.
+
             """
             self.problem = problem
+            self.positive = positive
+
+        def __call__(self, batch_idx, primal):
+            x, y, prob_feat, true_feat = self.problem.data[batch_idx]
+
+            b = prob_feat
+            b_bar = torch.mean(b)
+
+            # not sure whether we need the primal flag
+            # if primal:
+            # Logistic model returns prob 0 and prob 1, we want prob 1
+            yhat = self.problem.model(x)[:, 1]
+
+            y_bar = torch.mean(yhat)
+            d_w = (torch.mean(yhat * b - b_bar * y_bar)) / (b_bar * (1 - b_bar))
+            # CSL expects constraints to take the form g(x) <= c so if we want the constraint to be flipped we should return -g(x) otherwise we return just g(x)
+            if self.positive:
+                return -d_w
+            else:
+                return d_w
+
+    class CondtlCovariance:
+        def __init__(self, problem, positive=True, cov_prob_feat=True):
+            """
+            problem: Instantiation of the class that calls this constraint class. This is needed for some reason because we are making use of the __call__ function.
+            positive: A flag for the direction of the constraint. If true we want E(Cov(Y_hat, b |B)) >= 0. Default is True.
+            cov_prob_feat: A flag for whether to calculate E(Cov(Y_hat, b |B)) or E(Cov(Y_hat, B| b)). Default is to calculate E(Cov(Y_hat,b|B)).
+            """
+            self.problem = problem
+            self.positive = positive
+            self.cov_prob_feat = cov_prob_feat
 
         def __call__(self, batch_idx, primal):
             """
@@ -252,25 +305,28 @@ class fairClassification(csl.ConstrainedLearningProblem):
             """
             x, y, prob_feat, true_feat = self.problem.data[batch_idx]
 
-            B = true_feat
-            B_unique = torch.unique(B)
+            if self.cov_prob_feat:
+                condition_feat = true_feat
+                cov_feat = prob_feat
+            else:
+                condition_feat = prob_feat
+                cov_feat = true_feat
 
-            b = prob_feat
-
-            yhat = self.problem.model(x)
+            condition_feat_unique = torch.unique(condition_feat)
+            # Logistic model returns prob 0 and prob 1, we want prob 1
+            yhat = self.problem.model(x)[:, 1]
 
             # not sure whether we need to use the primal flag since our constraints are differentiable
             # calculate the expected covariance of yhat and b conditional on B.
-            if primal:
-                expect_cov = 0.0
-                for val in B_unique:
-                    expect_cov += self.calc_condtl_exp(yhat[:, 1], b, B, val)
+            # if primal:
+            expect_cov = 0.0
+            for val in condition_feat_unique:
+                expect_cov += self.calc_condtl_exp(yhat, cov_feat, condition_feat, val)
+            # CSL expects constraints to take the form g(x) <= 0 so if we want the covariance to be positive then we need to return -g(x) but if we want covariance to be negative we want g(x).
+            if self.positive:
+                return -expect_cov
             else:
-                expect_cov = 0.0
-                for val in B_unique:
-                    expect_cov += self.calc_condtl_exp(yhat[:, 1], b, B, val)
-            # our constraint should be of form g(x) <= 0 so if we want the covariance to be positive then we need to return -g(x) but if we want covariance to be negative we want g(x).
-            return -expect_cov
+                return expect_cov
 
         def calc_condtl_exp(self, yhat, prob_feat, true_feat, true_feat_value):
             # overly complex way to compute mean since pytorch doesn't let you take mean of boolean values??
@@ -285,11 +341,13 @@ class fairClassification(csl.ConstrainedLearningProblem):
             )
 
 
-# The first argument for rhs is the rhs value for disparity and the second position is for the conditional covariance.
+# Pass a list of the RHS values of the constraints. The class expects the ordering to be constraint values for D_l, D_w, E(Cov(Y_hat, b | B)), E(Cov(Y_hat, B | b))
 # if we pass rhs=None then it is equivalent to solving the unconstrained problem
 problems = {
     "unconstrained": fairClassification(train_data),
-    "constrained": fairClassification(train_data, rhs=[0.05]),
+    "constrained": fairClassification(
+        train_data, rhs=[1, 1, 0, 0], cov_positive=True, d_l_pos=False, d_w_pos=False
+    ),
 }
 
 
