@@ -6,11 +6,13 @@ import sys
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.model_selection import train_test_split
 
 import csl
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 ####################################
 # DATA                             #
@@ -182,6 +184,36 @@ class Logistic:
         return 1 / (1 + torch.exp(-x))
 
 
+class LogisticRegressionModel(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(LogisticRegressionModel, self).__init__()
+        self.linear = nn.Linear(input_dim, output_dim)
+
+    def forward(self, x):
+        out = torch.sigmoid(self.linear(x))
+        return torch.cat((1 - out, out), dim=1)
+
+
+class DeeperModel(nn.Module):
+    def __init__(self, input_size, layers_data: list):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        self.input_size = input_size
+        for size, activation in layers_data:
+            self.layers.append(nn.Linear(input_size, size))
+            input_size = size
+            if activation is not None:
+                assert isinstance(
+                    activation, nn.Module
+                ), "Each tuples should contain a size (int) and a torch.nn.modules.Module."
+                self.layers.append(activation)
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return torch.cat((1 - x, x), dim=1)
+
+
 ####################################
 # PROBLEM                          #
 ####################################
@@ -194,7 +226,14 @@ class fairClassification(csl.ConstrainedLearningProblem):
         d_l_pos: Flag for whether D_l constraint takes the form D_l <= a.
         d_w_pos: Flag for whether D_w constraint takes the form D_w <= a.
         """
-        self.model = Logistic(data[0][0].shape[1])
+        #         self.model = Logistic(data[0][0].shape[1])
+        self.model = csl.PytorchModel(
+            LogisticRegressionModel(data[0][0].shape[1], 1).to(device)
+        )
+        #         self.model = csl.PytorchModel(
+        #             DeeperModel(data[0][0].shape[1],
+        #                        [(64, nn.ReLU()), (32, nn.ReLU()), (1, nn.Sigmoid())]).to(device)
+        #         )
         self.data = data
         self.obj_function = self.loss
         self.cov_positive = cov_positive
@@ -220,17 +259,13 @@ class fairClassification(csl.ConstrainedLearningProblem):
         # Evaluate objective
         x, y, prob_feat, true_feat = self.data[batch_idx]
         yhat = self.model(x)
-
         # the original code regularizes the betas here but for the toy example we only have two features so it seems a bit unnecessary?
-        return F.cross_entropy(yhat, y) + 0 * (
-            self.model.parameters[0] ** 2 + self.model.parameters[1].norm() ** 2
-        )
+        return F.cross_entropy(yhat, y)
 
     class LinearDisparityEstimate:
         def __init__(self, problem, positive):
             """
             class for calculating the linear estimate of Demographic Parity
-
             problem: Instantiation of the class that calls this constraint class. This is needed for some reason because we are making use of the __call__ function.
             positive: A flag for the direction of the constraint. If true we want D_l >= c. Default is False.
             """
@@ -260,10 +295,8 @@ class fairClassification(csl.ConstrainedLearningProblem):
         def __init__(self, problem, positive):
             """
             Class for calculating the weighted estimate of Demographic Parity
-
             problem: Instantiation of the class that calls this constraint class. This is needed for some reason because we are making use of the __call__ function.
             positive: A flag for the direction of the constraint. If true we want D_w >= c. Default is False.
-
             """
             self.problem = problem
             self.positive = positive
@@ -281,6 +314,7 @@ class fairClassification(csl.ConstrainedLearningProblem):
 
             y_bar = torch.mean(yhat)
             d_w = (torch.mean(yhat * b - b_bar * y_bar)) / (b_bar * (1 - b_bar))
+            #             print(d_w)
             # CSL expects constraints to take the form g(x) <= c so if we want the constraint to be flipped we should return -g(x) otherwise we return just g(x)
             if self.positive:
                 return -d_w
@@ -305,23 +339,46 @@ class fairClassification(csl.ConstrainedLearningProblem):
             """
             x, y, prob_feat, true_feat = self.problem.data[batch_idx]
 
-            if self.cov_prob_feat:
-                condition_feat = true_feat
-                cov_feat = prob_feat
-            else:
-                condition_feat = prob_feat
-                cov_feat = true_feat
-
-            condition_feat_unique = torch.unique(condition_feat)
             # Logistic model returns prob 0 and prob 1, we want prob 1
             yhat = self.problem.model(x)[:, 1]
 
-            # not sure whether we need to use the primal flag since our constraints are differentiable
-            # calculate the expected covariance of yhat and b conditional on B.
-            # if primal:
-            expect_cov = 0.0
-            for val in condition_feat_unique:
-                expect_cov += self.calc_condtl_exp(yhat, cov_feat, condition_feat, val)
+            if self.cov_prob_feat:
+                # Calculate E[Cov(Yhat, b | B))]
+                condition_feat = true_feat
+                cov_feat = prob_feat
+                condition_feat_unique = torch.unique(condition_feat)
+                expect_cov = 0.0
+                for val in condition_feat_unique:
+                    expect_cov += self.calc_condtl_exp(
+                        yhat, cov_feat, condition_feat, val
+                    )
+            else:
+                # Calculate E[Cov(Yhat, B | b)]
+                # since b contains probabilities, we can't sum over all unique values
+                # we will split by percentiles, calculate covariance within each and then take weighted average
+                condition_feat = prob_feat
+                cov_feat = true_feat
+
+                expect_cov = 0.0
+                quantile_bins = torch.stack(
+                    [torch.quantile(condition_feat, i / 100) for i in range(100)]
+                )
+                bin_inds = torch.searchsorted(quantile_bins, condition_feat)
+                total_obs = len(condition_feat)
+                for i in range(100):
+                    mask = bin_inds == i
+                    cov_feat_subset = cov_feat[mask]
+                    yhat_subset = yhat[mask]
+                    if mask.sum() > 0:
+                        n_obs = mask.sum()
+                        cov = (
+                            (yhat_subset - torch.mean(yhat_subset))
+                            * (cov_feat_subset - torch.mean(cov_feat_subset))
+                        ).sum()
+                        #                         cov_percentile.append(cov * (n_obs/total_obs))
+                        expect_cov += cov * (n_obs / total_obs)
+            #                 expect_cov = torch.stack(cov_percentile).sum()
+            #             print(expect_cov)
             # CSL expects constraints to take the form g(x) <= 0 so if we want the covariance to be positive then we need to return -g(x) but if we want covariance to be negative we want g(x).
             if self.positive:
                 return -expect_cov
@@ -332,12 +389,13 @@ class fairClassification(csl.ConstrainedLearningProblem):
             # overly complex way to compute mean since pytorch doesn't let you take mean of boolean values??
             prob_emp = (true_feat == true_feat_value).sum().div(true_feat.shape[0])
             Y_hat = yhat[true_feat == true_feat_value]
+            y_hat_bar = torch.mean(Y_hat)
             b = prob_feat[true_feat == true_feat_value]
             b_bar = torch.mean(b)
             return (
                 prob_emp
                 * (1 / torch.sum(true_feat == true_feat_value))
-                * torch.sum(Y_hat * (b - b_bar))
+                * torch.sum((Y_hat - y_hat_bar) * (b - b_bar))
             )
 
 
@@ -346,7 +404,16 @@ class fairClassification(csl.ConstrainedLearningProblem):
 problems = {
     "unconstrained": fairClassification(train_data),
     "constrained": fairClassification(
-        train_data, rhs=[1, 1, 0, 0], cov_positive=True, d_l_pos=False, d_w_pos=False
+        train_data,
+        rhs=[
+            1,
+            #  1,
+            #  0,
+            0,
+        ],
+        cov_positive=True,
+        d_l_pos=False,
+        d_w_pos=False,
     ),
 }
 
@@ -355,10 +422,11 @@ problems = {
 # TRAINING                         #
 ####################################
 solver_settings = {
-    "iterations": 1400,
+    "iterations": 1000,
     "batch_size": None,
-    "primal_solver": lambda p: torch.optim.Adam(p, lr=0.2),
-    "dual_solver": lambda p: torch.optim.Adam(p, lr=0.01),
+    "verbose": 10,
+    "primal_solver": lambda p: torch.optim.Adam(p, lr=0.01),
+    "dual_solver": lambda p: torch.optim.Adam(p, lr=0.025),
 }
 solver = csl.PrimalDual(solver_settings)
 
